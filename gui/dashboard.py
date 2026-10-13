@@ -42,6 +42,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Dict, List, Optional
 
+from PIL import Image
+
 import customtkinter as ctk
 
 from core.scanner import DriveScanner, list_physical_drives
@@ -170,12 +172,28 @@ class SmartAutopsyApp(ctk.CTk):
         hdr.pack(side="top", fill="x", padx=0, pady=0)
         hdr.pack_propagate(False)
 
-        # Left side: logo text + subtitle
+        # Left side: logo image + subtitle
         left = ctk.CTkFrame(hdr, fg_color="transparent")
         left.pack(side="left", padx=20, pady=8)
 
+        # Load logo image (assets/logo.png lives next to the gui/ package)
+        _logo_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.png")
+        _logo_path = os.path.normpath(_logo_path)
+        try:
+            _pil_img   = Image.open(_logo_path).resize((48, 48), Image.LANCZOS)
+            _ctk_img   = ctk.CTkImage(light_image=_pil_img, dark_image=_pil_img, size=(48, 48))
+            ctk.CTkLabel(
+                left, image=_ctk_img, text="",
+            ).pack(side="left", padx=(0, 10))
+        except Exception:
+            # Fallback to text if image is missing
+            ctk.CTkLabel(
+                left, text="⬡",
+                font=FONT_TITLE, text_color=C["fg_accent"],
+            ).pack(side="left", padx=(0, 6))
+
         ctk.CTkLabel(
-            left, text="⬡ SMART AUTOPSY",
+            left, text="SMART AUTOPSY",
             font=FONT_TITLE, text_color=C["fg_accent"],
         ).pack(side="left", padx=(0, 14))
 
