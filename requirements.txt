@@ -1,4 +1,22 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart Autopsy — Python Package Dependencies
+# Install with: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
 customtkinter>=5.2.0
 recoverpy>=2.0.0
 numpy>=1.26.0
 pillow>=10.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System-Level Dependencies (Debian/Ubuntu/Kali — install via apt FIRST)
+# sudo apt update && sudo apt install -y \
+#     util-linux \
+#     e2fsprogs \
+#     lshw \
+#     parted
+#
+# Python runtime requirement: Python >= 3.9
+# Architecture requirement  : x86_64 (64-bit)
+# Privilege requirement     : sudo / root for raw block-device I/O
+# ─────────────────────────────────────────────────────────────────────────────
