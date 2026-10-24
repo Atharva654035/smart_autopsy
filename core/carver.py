@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .scanner import DriveScanner
+from .scanner import DriveScanner, MAX_HEADER_SIZE
 from .parsers import (
     carve_png,
     carve_jpeg,
@@ -60,8 +60,23 @@ log = logging.getLogger("smart_autopsy.carver")
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_FILE_BYTES: int = _PARSER_MAX_BYTES     # 250 MiB convenience ceiling (= max format cap)
 MIN_FILE_BYTES: int = _PARSER_MIN_BYTES     # 4 KiB minimum — discard fragments
-SLIDE_KEEP_BYTES: int = 16                  # bytes retained at buffer tail
-                                            # to catch signatures split across chunks
+
+# Bytes retained at the buffer tail to catch signatures that straddle a chunk
+# boundary.  Aligned with MAX_HEADER_SIZE exported by scanner (64 B).
+SLIDE_KEEP_BYTES: int = MAX_HEADER_SIZE  # 64 bytes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI thread throttling constants (v2.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Minimum wall-clock gap between two consecutive GUI progress dispatches.
+# Prevents CustomTkinter's main-thread rendering from locking under the
+# scan hot-path.  100 ms ≈ 10 FPS — imperceptible lag for a progress bar.
+UI_UPDATE_INTERVAL_MS: float    = 0.100  # seconds (100 ms)
+
+# Also cap by bytes: fire at most once per 10 MiB regardless of wall-clock
+# time, so a very slow I/O device doesn't spam the GUI either.
+UI_UPDATE_INTERVAL_BYTES: int   = 10 * 1024 * 1024  # 10 MiB
 
 # Default cap for legacy formats (GIF, ZIP, BMP, DOCX) that have no structural
 # parser.  100 MiB is a reasonable upper bound for compound-document formats.
@@ -128,6 +143,10 @@ _SORTED_HEADERS: List[bytes] = sorted(_HEADER_MAP.keys(), key=len, reverse=True)
 
 # Maximum header length — used to size the backward-scan window
 _MAX_HDR_LEN: int = max(len(h) for h in _SORTED_HEADERS)
+
+# All unique header bytes as a flat list, ordered longest-first, for use
+# with the C-native fast-path scanner in _find_next_header().
+_ALL_HEADERS_SORTED: List[bytes] = _SORTED_HEADERS  # alias for clarity
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +219,76 @@ def _hash_bytes(data: bytes) -> Tuple[str, str]:
     md5    = hashlib.md5(data).hexdigest()
     sha256 = hashlib.sha256(data).hexdigest()
     return md5, sha256
+
+
+def _find_next_header(
+    buf: bytes,
+    start: int,
+    sorted_headers: List[bytes],
+) -> Tuple[int, Optional[bytes]]:
+    """C-accelerated scan for the nearest file-format header in *buf[start:].
+
+    Uses ``bytes.find()`` — a C-native Boyer-Moore-Horspool implementation —
+    to locate each known signature in one pass per signature.  The function
+    returns the position and identity of the *earliest* match found.
+
+    Parameters
+    ----------
+    buf : bytes
+        The buffer to search (typically a 2 MiB chunk + MAX_HEADER_SIZE overlap).
+    start : int
+        Byte offset within *buf* at which to begin the search.
+    sorted_headers : list[bytes]
+        Header byte-strings ordered longest-first so more specific signatures
+        win over ambiguous shorter ones that match at the same position.
+
+    Returns
+    -------
+    (pos, header) : tuple[int, bytes | None]
+        *pos*    — index into *buf* of the first byte of the matched header, or
+                    ``len(buf)`` if nothing was found.
+        *header* — the matched header bytes, or ``None`` if nothing was found.
+    """
+    best_pos:    int           = len(buf)
+    best_header: Optional[bytes] = None
+
+    for hdr in sorted_headers:
+        pos = buf.find(hdr, start)
+        if pos == -1:
+            continue
+        if pos < best_pos or (pos == best_pos and best_header is not None and len(hdr) > len(best_header)):
+            best_pos    = pos
+            best_header = hdr
+
+    return best_pos, best_header
+
+
+def _is_blank_chunk(data: bytes) -> bool:
+    """Return True if *data* consists entirely of null bytes or 0xFF bytes.
+
+    Such regions correspond to unallocated, zeroed-out, or factory-erased
+    sectors and can be skipped without running any parser routines.  The check
+    is implemented via C-native ``bytes`` operations and is O(n) with a very
+    small constant.
+
+    Parameters
+    ----------
+    data : bytes
+        The raw chunk to inspect.
+
+    Returns
+    -------
+    bool
+        True when the chunk is provably empty / erased and safe to skip.
+    """
+    # Fast path: check the first and last byte before doing a full scan
+    if not data:
+        return True
+    first = data[0]
+    if first not in (0x00, 0xFF):
+        return False
+    # Leverage C-native count() to avoid a Python loop
+    return data.count(first) == len(data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -333,11 +422,6 @@ class FileCarver:
         bytes_scanned: int = 0
         carved_files: List[CarvedFile] = []
 
-        # ── Sliding window state ───────────────────────────────────────────
-        # `buf`      — continuous byte buffer across chunk boundaries
-        # `buf_base` — absolute device offset of buf[0]
-        buf:      bytearray = bytearray()
-        buf_base: int       = 0
 
         # Active carve state — set when a header has been matched
         carve_ext:    Optional[str]   = None   # file extension being carved
@@ -353,6 +437,33 @@ class FileCarver:
             _bytes_to_human(total_bytes) if total_bytes > 0 else "unknown",
         )
         t_start = time.monotonic()
+
+        # UI throttle state — track last callback time and bytes milestone
+        _last_ui_t:     float = t_start
+        _last_ui_bytes: int   = 0
+
+        def _maybe_notify(force: bool = False) -> None:
+            """Dispatch progress_callback when the throttle window has elapsed.
+
+            The callback is fired if *either* of the following is true:
+              - ``force`` is set (e.g. at scan completion)
+              - at least ``UI_UPDATE_INTERVAL_MS`` seconds have passed since
+                the last dispatch, AND at least ``UI_UPDATE_INTERVAL_BYTES``
+                have been scanned since the last dispatch.
+
+            This decouples the GUI render rate from the I/O rate, preventing
+            CustomTkinter's main thread from being starved by frequent redraws.
+            """
+            nonlocal _last_ui_t, _last_ui_bytes
+            if progress_callback is None:
+                return
+            now = time.monotonic()
+            bytes_since = bytes_scanned - _last_ui_bytes
+            time_since  = now - _last_ui_t
+            if force or (time_since >= UI_UPDATE_INTERVAL_MS and bytes_since >= UI_UPDATE_INTERVAL_BYTES):
+                progress_callback(bytes_scanned, total_bytes, len(carved_files))
+                _last_ui_t     = now
+                _last_ui_bytes = bytes_scanned
 
         def _flush_carved_file(force_structural: bool = False) -> Optional[CarvedFile]:
             """Validate and write the accumulated carve_buf to disk.
@@ -460,37 +571,47 @@ class FileCarver:
             carve_buf    = bytearray()
             return cf
 
-        # ── Main streaming loop ────────────────────────────────────────────
+        # ── Main streaming loop (v2.1 — 2 MiB chunks, C-level find) ────────
         try:
             for chunk_offset, chunk in scanner.read_blocks():
                 if self.stop_flag:
                     log.info("Stop flag set — halting carver at offset %d.", chunk_offset)
                     break
 
-                bytes_scanned += len(chunk)
-                buf.extend(chunk)
+                chunk_len = len(chunk)
+                bytes_scanned += chunk_len
 
-                # Process every byte position in the newly grown buffer
-                # We scan only the newly arrived portion, but we keep a
-                # _MAX_HDR_LEN tail from the previous iteration so that
-                # headers split across chunk boundaries are found.
-                scan_start = max(0, len(buf) - len(chunk) - _MAX_HDR_LEN)
+                # ── Fast path: skip blank (null / 0xFF) chunks ─────────────
+                # Unallocated or factory-erased sectors contain no file data.
+                # Using _is_blank_chunk() avoids running any parser routine on
+                # provably empty regions, saving significant CPU time on sparse
+                # or freshly wiped drives.
+                if not carve_ext and _is_blank_chunk(chunk):
+                    log.debug(
+                        "Skipping blank chunk at offset 0x%08X (%s)",
+                        chunk_offset, _bytes_to_human(chunk_len),
+                    )
+                    _maybe_notify()
+                    continue
 
-                i = scan_start
-                while i < len(buf):
+                # Work on an immutable bytes view so bytes.find() can operate
+                # at full C speed without copying the bytearray.
+                buf_view: bytes = bytes(chunk)
+                buf_len:  int   = len(buf_view)
 
-                    # ── If actively carving ───────────────────────────────
+                # scan_pos is our cursor into buf_view for header searches.
+                scan_pos: int = 0
+
+                while scan_pos < buf_len:
+
+                    # ── Actively carving a file ───────────────────────────
                     if carve_ext is not None:
 
-                        # ── Structural-parser branch ──────────────────────
-                        # For PNG/JPEG/PDF/MP3 we accumulate data until we
-                        # have MAX_FILE_BYTES or the buffer is exhausted,
-                        # then let the structural parser find the true end.
+                        # ── Structural-parser branch (PNG/JPEG/PDF/MP3) ───
                         if carve_ext in _STRUCTURAL_EXTS:
-                            carve_buf.extend(buf[i:])
-                            i = len(buf)
+                            carve_buf.extend(buf_view[scan_pos:])
+                            scan_pos = buf_len
 
-                            # Use the per-format cap to decide when to force-flush
                             _fmt_cap: int = FORMAT_MAX_BYTES.get(carve_ext, MAX_FILE_BYTES)
                             if len(carve_buf) >= _fmt_cap:
                                 log.info(
@@ -501,30 +622,27 @@ class FileCarver:
                                 cf = _flush_carved_file()
                                 if cf:
                                     carved_files.append(cf)
-                                    if progress_callback:
-                                        progress_callback(bytes_scanned, total_bytes, len(carved_files))
+                                    _maybe_notify()
                             continue
 
-                        # ── Legacy footer-scan branch ─────────────────────
-                        remaining = bytes(buf[i:])
-
-                        footer_pos = remaining.find(carve_footer)  # type: ignore[arg-type]
+                        # ── Legacy footer-scan branch (GIF, ZIP, BMP, DOCX)
+                        # Use C-native bytes.find() instead of a Python loop.
+                        footer_pos = buf_view.find(carve_footer, scan_pos)  # type: ignore[arg-type]
                         if footer_pos != -1:
-                            end_pos = i + footer_pos + len(carve_footer)  # type: ignore[arg-type]
-                            carve_buf.extend(buf[i:end_pos])
+                            end_pos = footer_pos + len(carve_footer)          # type: ignore[arg-type]
+                            carve_buf.extend(buf_view[scan_pos:end_pos])
 
                             cf = _flush_carved_file()
                             if cf:
                                 carved_files.append(cf)
-                                if progress_callback:
-                                    progress_callback(bytes_scanned, total_bytes, len(carved_files))
+                                _maybe_notify()
 
-                            i = end_pos
+                            scan_pos = end_pos
                             continue
 
-                        # No footer yet — accumulate and guard legacy max size
-                        carve_buf.extend(buf[i:])
-                        i = len(buf)
+                        # No footer yet — accumulate remainder of this chunk
+                        carve_buf.extend(buf_view[scan_pos:])
+                        scan_pos = buf_len
 
                         if len(carve_buf) > _LEGACY_MAX_BYTES:
                             log.warning(
@@ -537,38 +655,31 @@ class FileCarver:
                             carve_buf    = bytearray()
                         continue
 
-                    # ── Not carving — scan for headers ────────────────────
-                    matched = False
-                    for hdr in self._sorted_headers:
-                        hlen = len(hdr)
-                        if buf[i:i + hlen] == hdr:
-                            carve_ext    = self._header_map[hdr][0]
-                            carve_footer = self._header_map[hdr][1]
-                            carve_start  = buf_base + i
-                            carve_buf    = bytearray(hdr)
-                            log.debug(
-                                "Header match: %s @ 0x%08X",
-                                carve_ext, carve_start,
-                            )
-                            i += hlen
-                            matched = True
-                            break
+                    # ── Not carving — fast C-level header search ──────────
+                    # _find_next_header() calls bytes.find() for every known
+                    # signature and returns the earliest match position.  This
+                    # replaces the old byte-by-byte Python loop and is orders
+                    # of magnitude faster on 2 MiB buffers.
+                    match_pos, matched_hdr = _find_next_header(
+                        buf_view, scan_pos, self._sorted_headers
+                    )
 
-                    if not matched:
-                        i += 1
+                    if matched_hdr is None:
+                        # No header in remainder of this chunk
+                        break
 
-                # Trim the buffer: keep only the tail we need for the next
-                # iteration's backward-scan window (_MAX_HDR_LEN bytes).
-                # Do NOT trim while a structural-format carve is in progress
-                # (the whole carve_buf is what matters; buf can still be trimmed).
-                if not carve_ext:
-                    trim_at = max(0, len(buf) - _MAX_HDR_LEN)
-                    buf_base += trim_at
-                    del buf[:trim_at]
+                    carve_ext    = self._header_map[matched_hdr][0]
+                    carve_footer = self._header_map[matched_hdr][1]
+                    carve_start  = chunk_offset + match_pos
+                    carve_buf    = bytearray(matched_hdr)
+                    log.debug(
+                        "Header match: %s @ 0x%08X",
+                        carve_ext, carve_start,
+                    )
+                    scan_pos = match_pos + len(matched_hdr)
 
-                # Progress notification
-                if progress_callback:
-                    progress_callback(bytes_scanned, total_bytes, len(carved_files))
+                # Throttled UI update — at most once per 100 ms / 10 MiB
+                _maybe_notify()
 
         finally:
             scanner.close()
@@ -584,10 +695,14 @@ class FileCarver:
             if cf:
                 carved_files.append(cf)
 
+        # Final forced UI update so the GUI reaches 100 %
+        _maybe_notify(force=True)
+
         elapsed = time.monotonic() - t_start
+        speed_mib = (bytes_scanned / (1024 * 1024)) / max(elapsed, 1e-9)
         log.info(
-            "carve_stream complete  duration=%.1fs  bytes=%s  files=%d",
-            elapsed, _bytes_to_human(bytes_scanned), len(carved_files),
+            "carve_stream complete  duration=%.1fs  speed=%.1f MiB/s  bytes=%s  files=%d",
+            elapsed, speed_mib, _bytes_to_human(bytes_scanned), len(carved_files),
         )
 
         return carved_files
