@@ -40,6 +40,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .scanner import DriveScanner
+from .parsers import (
+    carve_png,
+    carve_jpeg,
+    carve_pdf,
+    carve_mp3,
+    FORMAT_MAX_BYTES,
+    MIN_FILE_BYTES as _PARSER_MIN_BYTES,
+    MAX_FILE_BYTES as _PARSER_MAX_BYTES,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -49,9 +58,25 @@ log = logging.getLogger("smart_autopsy.carver")
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-MAX_FILE_BYTES: int = 50 * 1024 * 1024      # 50 MiB hard cap per carved file
+MAX_FILE_BYTES: int = _PARSER_MAX_BYTES     # 250 MiB convenience ceiling (= max format cap)
+MIN_FILE_BYTES: int = _PARSER_MIN_BYTES     # 4 KiB minimum — discard fragments
 SLIDE_KEEP_BYTES: int = 16                  # bytes retained at buffer tail
                                             # to catch signatures split across chunks
+
+# Default cap for legacy formats (GIF, ZIP, BMP, DOCX) that have no structural
+# parser.  100 MiB is a reasonable upper bound for compound-document formats.
+_LEGACY_MAX_BYTES: int = 100 * 1024 * 1024
+
+# File types handled by structural/chunk-level parsers (not naive footer scan)
+_STRUCTURAL_EXTS: frozenset = frozenset({"png", "jpg", "pdf", "mp3"})
+
+# Map extension to its structural parser function
+_STRUCTURAL_PARSER_MAP = {
+    "png": carve_png,
+    "jpg": carve_jpeg,
+    "pdf": carve_pdf,
+    "mp3": carve_mp3,
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Signature table
@@ -329,17 +354,76 @@ class FileCarver:
         )
         t_start = time.monotonic()
 
-        def _flush_carved_file() -> Optional[CarvedFile]:
-            """Write the accumulated carve_buf to disk and return metadata."""
+        def _flush_carved_file(force_structural: bool = False) -> Optional[CarvedFile]:
+            """Validate and write the accumulated carve_buf to disk.
+
+            For formats in _STRUCTURAL_EXTS the raw buffer is passed through
+            the dedicated structural parser.  The parser enforces CRC/segment
+            validation and the global 4 KiB minimum-size filter.  If the parser
+            rejects the candidate the carve state is reset and None is returned.
+
+            For all other formats (GIF, ZIP, BMP, DOCX, …) the legacy
+            footer-search approach is used, but the 4 KiB filter is still
+            applied before writing.
+            """
             nonlocal file_counter, carve_ext, carve_footer, carve_start, carve_buf
 
             if not carve_buf or carve_ext is None:
                 return None
 
+            raw: bytes = bytes(carve_buf)
+            data: Optional[bytes] = None
+
+            # ── Structural parser path ─────────────────────────────────────
+            if carve_ext in _STRUCTURAL_EXTS:
+                parser = _STRUCTURAL_PARSER_MAP[carve_ext]
+                fmt_cap: int = FORMAT_MAX_BYTES.get(carve_ext, MAX_FILE_BYTES)
+                data, status = parser(raw, offset=0, max_bytes=fmt_cap)
+                if data is None:
+                    log.debug(
+                        "Structural parser rejected %s @ 0x%08X: %s",
+                        carve_ext, carve_start, status,
+                    )
+                    # Reset state and return — do NOT write
+                    carve_ext    = None
+                    carve_footer = None
+                    carve_start  = 0
+                    carve_buf    = bytearray()
+                    return None
+                log.debug("Structural parser accepted %s: %s", carve_ext, status)
+
+            else:
+                # ── Legacy path (GIF, ZIP, BMP, DOCX …) ──────────────────
+                # Enforce 4 KiB minimum and 100 MiB maximum for legacy formats
+                if len(raw) < MIN_FILE_BYTES:
+                    log.debug(
+                        "Discarding %s @ 0x%08X — %d B < %d B minimum",
+                        carve_ext, carve_start, len(raw), MIN_FILE_BYTES,
+                    )
+                    carve_ext    = None
+                    carve_footer = None
+                    carve_start  = 0
+                    carve_buf    = bytearray()
+                    return None
+                if len(raw) > _LEGACY_MAX_BYTES:
+                    log.warning(
+                        "Discarding %s @ 0x%08X — %d B exceeds legacy cap %s",
+                        carve_ext, carve_start, len(raw),
+                        _bytes_to_human(_LEGACY_MAX_BYTES),
+                    )
+                    carve_ext    = None
+                    carve_footer = None
+                    carve_start  = 0
+                    carve_buf    = bytearray()
+                    return None
+                data = raw
+
+            # ── Write to disk ──────────────────────────────────────────────
             file_counter += 1
-            fname   = f"recovered_{file_counter:05d}.{carve_ext}"
+            # Use .jpg extension for JPEG (internal ext is 'jpg')
+            file_ext = carve_ext
+            fname   = f"recovered_{file_counter:05d}.{file_ext}"
             fpath   = os.path.join(output_dir, fname)
-            data    = bytes(carve_buf)
             md5, sha256 = _hash_bytes(data)
 
             try:
@@ -347,11 +431,15 @@ class FileCarver:
                     fout.write(data)
             except OSError as exc:
                 log.error("Failed to write carved file '%s': %s", fpath, exc)
+                carve_ext    = None
+                carve_footer = None
+                carve_start  = 0
+                carve_buf    = bytearray()
                 return None
 
             cf = CarvedFile(
                 name        = fname,
-                file_type   = carve_ext.upper(),
+                file_type   = file_ext.upper(),
                 offset_hex  = f"0x{carve_start:08X}",
                 offset_int  = carve_start,
                 size_bytes  = len(data),
@@ -393,16 +481,38 @@ class FileCarver:
 
                     # ── If actively carving ───────────────────────────────
                     if carve_ext is not None:
+
+                        # ── Structural-parser branch ──────────────────────
+                        # For PNG/JPEG/PDF/MP3 we accumulate data until we
+                        # have MAX_FILE_BYTES or the buffer is exhausted,
+                        # then let the structural parser find the true end.
+                        if carve_ext in _STRUCTURAL_EXTS:
+                            carve_buf.extend(buf[i:])
+                            i = len(buf)
+
+                            # Use the per-format cap to decide when to force-flush
+                            _fmt_cap: int = FORMAT_MAX_BYTES.get(carve_ext, MAX_FILE_BYTES)
+                            if len(carve_buf) >= _fmt_cap:
+                                log.info(
+                                    "Structural parser: buffer reached %s cap for %s @ %s — flushing.",
+                                    _bytes_to_human(_fmt_cap), carve_ext,
+                                    f"0x{carve_start:08X}",
+                                )
+                                cf = _flush_carved_file()
+                                if cf:
+                                    carved_files.append(cf)
+                                    if progress_callback:
+                                        progress_callback(bytes_scanned, total_bytes, len(carved_files))
+                            continue
+
+                        # ── Legacy footer-scan branch ─────────────────────
                         remaining = bytes(buf[i:])
 
-                        # Check for footer
                         footer_pos = remaining.find(carve_footer)  # type: ignore[arg-type]
                         if footer_pos != -1:
-                            # Include the footer itself
                             end_pos = i + footer_pos + len(carve_footer)  # type: ignore[arg-type]
                             carve_buf.extend(buf[i:end_pos])
 
-                            # Flush
                             cf = _flush_carved_file()
                             if cf:
                                 carved_files.append(cf)
@@ -412,14 +522,14 @@ class FileCarver:
                             i = end_pos
                             continue
 
-                        # No footer yet — accumulate everything and guard max size
+                        # No footer yet — accumulate and guard legacy max size
                         carve_buf.extend(buf[i:])
                         i = len(buf)
 
-                        if len(carve_buf) > MAX_FILE_BYTES:
+                        if len(carve_buf) > _LEGACY_MAX_BYTES:
                             log.warning(
                                 "Max size (%s) exceeded for %s at offset %s — discarding.",
-                                _bytes_to_human(MAX_FILE_BYTES), carve_ext,
+                                _bytes_to_human(_LEGACY_MAX_BYTES), carve_ext,
                                 f"0x{carve_start:08X}",
                             )
                             carve_ext    = None
@@ -449,8 +559,8 @@ class FileCarver:
 
                 # Trim the buffer: keep only the tail we need for the next
                 # iteration's backward-scan window (_MAX_HDR_LEN bytes).
-                # If we are mid-carve we must not trim carve data — but
-                # carve_buf is separate, so buf itself can still be trimmed.
+                # Do NOT trim while a structural-format carve is in progress
+                # (the whole carve_buf is what matters; buf can still be trimmed).
                 if not carve_ext:
                     trim_at = max(0, len(buf) - _MAX_HDR_LEN)
                     buf_base += trim_at
@@ -463,10 +573,11 @@ class FileCarver:
         finally:
             scanner.close()
 
-        # Flush any in-progress carve that reached EOF without a footer
+        # Flush any in-progress carve that reached EOF without a footer.
+        # For structural formats the parser will decide validity/completeness.
         if carve_ext and carve_buf:
             log.info(
-                "EOF reached mid-carve for %s @ %s — flushing %s without footer.",
+                "EOF reached mid-carve for %s @ %s — flushing %s.",
                 carve_ext, f"0x{carve_start:08X}", _bytes_to_human(len(carve_buf)),
             )
             cf = _flush_carved_file()
