@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .scanner import DriveScanner, MAX_HEADER_SIZE
+from .scanner import DriveScanner, CHUNK_SIZE, OVERLAP_SIZE, MAX_HEADER_SIZE
 from .parsers import (
     carve_png,
     carve_jpeg,
@@ -62,8 +62,10 @@ MAX_FILE_BYTES: int = _PARSER_MAX_BYTES     # 250 MiB convenience ceiling (= max
 MIN_FILE_BYTES: int = _PARSER_MIN_BYTES     # 4 KiB minimum — discard fragments
 
 # Bytes retained at the buffer tail to catch signatures that straddle a chunk
-# boundary.  Aligned with MAX_HEADER_SIZE exported by scanner (64 B).
-SLIDE_KEEP_BYTES: int = MAX_HEADER_SIZE  # 64 bytes
+# boundary.  Must match scanner.OVERLAP_SIZE (4 KiB = one full sector block)
+# so the two layers stay in sync.  The old value (MAX_HEADER_SIZE = 64 B) was
+# insufficient for signatures split near the 2 MiB boundary.
+SLIDE_KEEP_BYTES: int = OVERLAP_SIZE  # 4096 bytes — 1 full sector block
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UI thread throttling constants (v2.1)
@@ -571,7 +573,22 @@ class FileCarver:
             carve_buf    = bytearray()
             return cf
 
-        # ── Main streaming loop (v2.1 — 2 MiB chunks, C-level find) ────────
+        # ── Main streaming loop (v2.2 — zero-skip 4 KiB overlap) ────────────
+        #
+        # scanner.read_blocks() yields (window_start_offset, buffer) where:
+        #   buffer = overlap_bytes_from_prev_chunk + incoming_chunk
+        #   window_start_offset = global_disk_offset - len(overlap_bytes)
+        #
+        # For a header detected at index match_pos inside buffer, the absolute
+        # physical disk offset is:
+        #   carve_start = window_start_offset + match_pos
+        #
+        # The scanner guarantees full-buffer coverage — signatures split across
+        # the 2 MiB chunk boundary are captured in the overlap prefix.  The
+        # carver MUST search all the way to len(buf_view), not stopping early.
+        #
+        # Both allocated (live) and unallocated (deleted) sectors are carved;
+        # cluster allocation state is NOT consulted at this layer.
         try:
             for chunk_offset, chunk in scanner.read_blocks():
                 if self.stop_flag:
@@ -670,11 +687,14 @@ class FileCarver:
 
                     carve_ext    = self._header_map[matched_hdr][0]
                     carve_footer = self._header_map[matched_hdr][1]
+                    # chunk_offset is already window_start_offset (= global_disk_offset
+                    # minus len(overlap_bytes)), so adding match_pos gives the exact
+                    # absolute physical sector byte offset of this header.
                     carve_start  = chunk_offset + match_pos
                     carve_buf    = bytearray(matched_hdr)
                     log.debug(
-                        "Header match: %s @ 0x%08X",
-                        carve_ext, carve_start,
+                        "Header match: %s @ 0x%08X (buf_idx=%d, window_start=0x%08X)",
+                        carve_ext, carve_start, match_pos, chunk_offset,
                     )
                     scan_pos = match_pos + len(matched_hdr)
 

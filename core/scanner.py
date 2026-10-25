@@ -24,12 +24,21 @@ Root access is mandatory for physical block devices (/dev/sdX, /dev/nvme0n1,
 etc.).  Disk image files (.dd, .img, .raw, .E01-raw) can be read as a normal
 user if file permissions allow.
 
-Performance Notes (v2.1 — High-Speed Scanning)
-───────────────────────────────────────────────
-Read-block size increased to 2 MiB (READ_BLOCK_SIZE) to amortise per-syscall
-overhead and saturate modern SATA / NVMe bandwidth.  A MAX_HEADER_SIZE
-(64-byte) overlap is maintained across chunk boundaries so headers that straddle
-a boundary are never missed by the carver.
+Performance Notes (v2.2 — Zero-Skip Sliding Window)
+────────────────────────────────────────────────────
+Read-block size is CHUNK_SIZE = 2 MiB to amortise per-syscall overhead and
+saturate modern SATA / NVMe bandwidth.  A full OVERLAP_SIZE = 4 KiB (one
+complete 512-byte sector block × 8) window is maintained across chunk
+boundaries so that any file-format signature — even one split arbitrarily
+across the 2 MiB boundary — is captured in a single combined buffer pass.
+
+Offset arithmetic guarantee
+  For a match found at index ``i`` inside the combined buffer:
+      absolute_disk_offset = global_disk_offset + i - len(overlap_bytes)
+  where ``global_disk_offset`` is the byte position of the *first newly read
+  byte* (i.e. it does NOT include the overlap prefix).  This is the only
+  value advanced by ``len(incoming_chunk)`` after each read, ensuring
+  neither double-counting nor sector skipping occurs.
 
 Author : Smart Autopsy Engineering Team
 Python : 3.9+
@@ -38,8 +47,6 @@ OS     : Linux (util-linux ≥ 2.36 required for lsblk --json)
 
 from __future__ import annotations
 
-import ctypes
-import fcntl
 import json
 import logging
 import os
@@ -47,6 +54,16 @@ import struct
 import subprocess
 import sys
 from typing import Dict, Generator, List, Optional, Tuple
+
+# fcntl and ctypes are Linux-only; guard so the module can be imported on
+# Windows (e.g. for unit testing on developer machines without a Linux VM).
+if sys.platform != "win32":
+    import ctypes
+    import fcntl
+else:
+    ctypes = None  # type: ignore[assignment]
+    fcntl  = None  # type: ignore[assignment]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -71,18 +88,25 @@ _ACCEPTED_TYPES: frozenset = frozenset({"disk", "part", "loop", "rom"})
 _SIZE_SUFFIXES: Tuple[str, ...] = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Performance constants (v2.1 optimisation)
+# Performance constants (v2.2 — zero-skip sliding window)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 2 MiB read block — large enough to saturate SATA/NVMe, small enough to stay
 # safely below OS per-read limits and comfortably in L3 cache.
-READ_BLOCK_SIZE: int = 2 * 1024 * 1024  # 2 MiB
+CHUNK_SIZE: int = 2 * 1024 * 1024       # 2 MiB
 
-# Maximum byte-length of any file-format header we need to detect.
-# 64 bytes is a generous conservative bound that covers all signatures in the
-# current carver table (longest is 8 bytes for PNG) and leaves headroom for
-# future additions without requiring a scanner change.
-MAX_HEADER_SIZE: int = 64  # bytes
+# Backward-compat alias so any external code still importing READ_BLOCK_SIZE
+# continues to work without modification.
+READ_BLOCK_SIZE: int = CHUNK_SIZE
+
+# Overlap window maintained at the tail of each 2 MiB read so that file-format
+# signatures that are split across the chunk boundary are never missed.
+# Set to exactly one full 4 KiB sector block so even the worst-case split
+# (signature begins in the last byte of chunk N) is captured.
+OVERLAP_SIZE: int = 4096                # 4 KiB — 1 sector block
+
+# Backward-compat alias (previous value was 64 B; new value is 4 KiB).
+MAX_HEADER_SIZE: int = OVERLAP_SIZE
 
 # Permission-denied hint printed to the operator
 _PERMISSION_HINT: str = (
@@ -269,18 +293,37 @@ class DriveScanner:
     target_path : str
         Absolute path to the block device or image file.
     chunk_size : int
-        Number of bytes yielded per iteration (default 2 MiB = READ_BLOCK_SIZE).
+        Number of bytes read per OS read call (default ``CHUNK_SIZE`` = 2 MiB).
+    overlap_size : int
+        Number of bytes retained from the tail of each chunk and prepended to
+        the next (default ``OVERLAP_SIZE`` = 4 KiB).  This is the zero-skip
+        guarantee: any signature split at the chunk boundary is captured.
     is_block_device : bool
         True if ``target_path`` refers to a ``/dev/`` block device.
 
-    Performance (v2.1)
-    ------------------
-    The default ``chunk_size`` is now ``READ_BLOCK_SIZE`` (2 MiB) instead of
-    the old 4 KiB.  This dramatically reduces per-syscall overhead and allows
-    the C-level ``bytes.find()`` inside the carver to search large contiguous
-    buffers in a single pass — the primary source of the 30–80× throughput
-    improvement.  A ``MAX_HEADER_SIZE``-byte overlap window is maintained
-    across chunk boundaries so no signatures are missed.
+    Sliding-Window Design (v2.2)
+    ----------------------------
+    For each OS read of ``chunk_size`` bytes the generator constructs::
+
+        buffer = overlap_bytes + incoming_chunk
+
+    and yields ``(window_start_offset, buffer)`` where::
+
+        window_start_offset = global_disk_offset - len(overlap_bytes)
+
+    ``global_disk_offset`` tracks the byte position of the *first byte of the
+    incoming_chunk* (never includes the overlap prefix itself).  After yielding,
+    ``overlap_bytes`` is updated to ``incoming_chunk[-overlap_size:]`` and
+    ``global_disk_offset`` is advanced by ``len(incoming_chunk)`` — exactly once
+    per chunk, preventing double-counting or sector skipping.
+
+    Absolute offset formula for a signature found at index ``i`` in *buffer*::
+
+        absolute_disk_offset = window_start_offset + i
+                             = global_disk_offset - len(overlap_bytes) + i
+
+    Both allocated (live) and unallocated (deleted) sectors are streamed;
+    cluster allocation state is irrelevant at this layer.
 
     Parameters
     ----------
@@ -288,7 +331,9 @@ class DriveScanner:
         Path to a block device (``/dev/sdb``) or forensic disk image
         (``.dd``, ``.img``, ``.raw``).
     chunk_size : int, optional
-        Read granularity in bytes (default ``READ_BLOCK_SIZE`` = 2 MiB).
+        OS read granularity in bytes (default ``CHUNK_SIZE`` = 2 MiB).
+    overlap_size : int, optional
+        Overlap window in bytes (default ``OVERLAP_SIZE`` = 4 KiB).
 
     Raises
     ------
@@ -296,15 +341,21 @@ class DriveScanner:
         If *target_path* does not exist on the filesystem.
     """
 
-    def __init__(self, target_path: str, chunk_size: int = READ_BLOCK_SIZE) -> None:
+    def __init__(
+        self,
+        target_path: str,
+        chunk_size: int = CHUNK_SIZE,
+        overlap_size: int = OVERLAP_SIZE,
+    ) -> None:
         if not os.path.exists(target_path):
             raise FileNotFoundError(
                 f"Target not found: '{target_path}'\n"
                 "Verify the device is connected and the path is correct."
             )
 
-        self.target_path: str   = os.path.realpath(target_path)
-        self.chunk_size:  int   = chunk_size
+        self.target_path:  str  = os.path.realpath(target_path)
+        self.chunk_size:   int  = chunk_size
+        self.overlap_size: int  = overlap_size
         self.is_block_device: bool = self.target_path.startswith("/dev/")
 
         # Lazily opened file descriptor; None until first read_blocks() call
@@ -312,8 +363,11 @@ class DriveScanner:
         self._fh: Optional[object]  = None   # Python file object (image files)
 
         log.info(
-            "DriveScanner ready  target='%s'  chunk=%s  block_device=%s",
-            self.target_path, _bytes_to_human(self.chunk_size), self.is_block_device,
+            "DriveScanner ready  target='%s'  chunk=%s  overlap=%s  block_device=%s",
+            self.target_path,
+            _bytes_to_human(self.chunk_size),
+            _bytes_to_human(self.overlap_size),
+            self.is_block_device,
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -441,43 +495,50 @@ class DriveScanner:
         start_offset: int = 0,
         num_blocks: Optional[int] = None,
     ) -> Generator[Tuple[int, bytes], None, None]:
-        """Stream raw byte chunks from the target medium (v2.1 — 2 MiB blocks).
+        """Stream raw byte chunks from the target medium (v2.2 — zero-skip window).
 
         Opens the device/file in binary read-only mode (if not already open),
-        seeks to *start_offset*, then yields ``(offset, chunk)`` tuples
-        continuously until *num_blocks* have been produced or EOF is reached.
+        seeks to *start_offset*, then yields ``(window_start_offset, buffer)``
+        tuples continuously until *num_blocks* raw reads have been performed or
+        EOF is reached.
 
-        Performance (v2.1)
-        ------------------
-        Each physical read is ``chunk_size`` bytes (default 2 MiB), reducing
-        per-syscall overhead by a factor of 512 compared to the old 4 KiB reads.
-        To ensure headers that straddle a chunk boundary are not missed, the
-        last ``MAX_HEADER_SIZE`` bytes of every chunk are prepended to the
-        *next* chunk before it is yielded.  The yielded ``offset`` always
-        reflects the start of this overlap window so absolute addressing
-        remains consistent for the carver.
+        Sliding-Window Guarantee (v2.2)
+        --------------------------------
+        For each OS read of ``chunk_size`` bytes:
 
-        The generator holds at most ``chunk_size + MAX_HEADER_SIZE`` bytes in
-        memory at any one time — safe for terabyte-scale drives on constrained
-        forensic workstations.
+        1.  ``buffer = overlap_bytes + incoming_chunk``
+            where ``len(overlap_bytes) <= overlap_size`` (= 4 KiB).
+
+        2.  ``window_start_offset = global_disk_offset - len(overlap_bytes)``
+            where ``global_disk_offset`` is the absolute position of
+            ``incoming_chunk[0]`` on the medium.
+
+        3.  After the yield, ``overlap_bytes`` is updated to
+            ``incoming_chunk[-overlap_size:]`` and ``global_disk_offset`` is
+            advanced by ``len(incoming_chunk)`` — exactly once, preventing
+            double-counting or sector skipping.
+
+        4.  The carver MUST scan the **full** buffer (to ``len(buffer)``).
+
+        5.  Absolute offset of a match at index ``i``::
+
+                absolute = window_start_offset + i
+
+        Both allocated and unallocated sectors are streamed unconditionally.
 
         Parameters
         ----------
         start_offset : int
             Absolute byte offset at which to begin reading (default ``0``).
         num_blocks : int | None
-            Maximum number of chunks to yield.  ``None`` (default) means read
-            until EOF.
+            Maximum number of raw-read iterations to perform.
+            ``None`` (default) means read until EOF.
 
         Yields
         ------
-        (offset, data) : tuple[int, bytes]
-            *offset* — absolute byte position on the device where *data*
-                        begins.  When the overlap is active the offset reflects
-                        the start of the ``MAX_HEADER_SIZE``-byte tail prepended
-                        from the previous chunk.
-            *data*   — raw bytes of length ``≤ chunk_size + MAX_HEADER_SIZE``;
-                        the final chunk may be shorter.
+        (window_start_offset, buffer) : tuple[int, bytes]
+            *window_start_offset* — disk byte position of ``buffer[0]``.
+            *buffer*              — ``overlap_bytes + incoming_chunk``.
 
         Raises
         ------
@@ -488,13 +549,14 @@ class DriveScanner:
         """
         self._open()
 
-        # current_offset tracks the next byte to be physically read from disk
-        current_offset: int = start_offset
+        # global_disk_offset: absolute position of the first byte of the NEXT
+        # OS read.  Advanced by len(incoming_chunk) only — never by len(buffer).
+        global_disk_offset: int = start_offset
         blocks_yielded: int = 0
 
-        # Sliding overlap: tail of the last raw chunk, up to MAX_HEADER_SIZE bytes.
-        # Prepended to every subsequent window so boundary-spanning headers survive.
-        overlap: bytes = b""
+        # overlap_bytes: last overlap_size bytes of the previous incoming_chunk.
+        # Prepended to each new read to bridge the chunk boundary.
+        overlap_bytes: bytes = b""
 
         try:
             # Seek to the requested start position
@@ -504,8 +566,12 @@ class DriveScanner:
                 os.lseek(self._fd, start_offset, os.SEEK_SET)      # type: ignore[arg-type]
 
             log.info(
-                "Block stream started  device='%s'  offset=%d  chunk=%s  limit=%s",
-                self.target_path, start_offset, _bytes_to_human(self.chunk_size),
+                "Block stream started  device='%s'  offset=%d  chunk=%s  "
+                "overlap=%s  limit=%s",
+                self.target_path,
+                start_offset,
+                _bytes_to_human(self.chunk_size),
+                _bytes_to_human(self.overlap_size),
                 str(num_blocks) if num_blocks is not None else "unlimited",
             )
 
@@ -517,45 +583,52 @@ class DriveScanner:
 
                 # ── Read one full chunk from the device / image ────────────
                 if self._fh is not None:
-                    raw_chunk: bytes = self._fh.read(self.chunk_size)   # type: ignore[union-attr]
+                    incoming_chunk: bytes = self._fh.read(self.chunk_size)   # type: ignore[union-attr]
                 else:
-                    raw_chunk = os.read(self._fd, self.chunk_size)      # type: ignore[arg-type]
+                    incoming_chunk = os.read(self._fd, self.chunk_size)      # type: ignore[arg-type]
 
-                if not raw_chunk:
-                    log.debug("EOF reached at offset %d.", current_offset)
+                if not incoming_chunk:
+                    log.debug(
+                        "EOF reached at global_disk_offset=%d.", global_disk_offset
+                    )
                     break
 
-                # ── Assemble the yielded window ───────────────────────────
-                # window = [overlap from previous chunk] + [newly read bytes]
-                # The offset of window[0] is (current_offset - len(overlap)).
-                window: bytes = overlap + raw_chunk
-                window_offset: int = current_offset - len(overlap)
+                # ── Assemble zero-skip combined buffer ─────────────────────
+                # buffer[0] == disk byte at (global_disk_offset - len(overlap_bytes))
+                buffer: bytes = overlap_bytes + incoming_chunk
+                window_start_offset: int = global_disk_offset - len(overlap_bytes)
 
-                yield window_offset, window
+                yield window_start_offset, buffer
 
-                # Keep the last MAX_HEADER_SIZE bytes as the next iteration's
-                # overlap so boundary-spanning signatures are never missed.
-                overlap = raw_chunk[-MAX_HEADER_SIZE:] if len(raw_chunk) >= MAX_HEADER_SIZE else raw_chunk
-
-                current_offset += len(raw_chunk)
+                # ── Advance sliding state ──────────────────────────────────
+                # Overlap = last overlap_size bytes of the FRESH chunk only.
+                # Offset counter advances by len(incoming_chunk), never by len(buffer).
+                chunk_len: int = len(incoming_chunk)
+                overlap_bytes = (
+                    incoming_chunk[-self.overlap_size:]
+                    if chunk_len >= self.overlap_size
+                    else incoming_chunk
+                )
+                global_disk_offset += chunk_len
                 blocks_yielded += 1
 
             log.info(
                 "Block stream complete  blocks=%d  bytes_read=%s",
-                blocks_yielded, _bytes_to_human(current_offset - start_offset),
+                blocks_yielded,
+                _bytes_to_human(global_disk_offset - start_offset),
             )
 
         except PermissionError:
             log.critical(
-                "Permission denied while reading '%s' at offset %d.",
-                self.target_path, current_offset,
+                "Permission denied while reading '%s' at global_disk_offset=%d.",
+                self.target_path, global_disk_offset,
             )
             print(_PERMISSION_HINT, file=sys.stderr)
             raise
         except OSError as exc:
             log.error(
-                "I/O error at offset %d on '%s': %s",
-                current_offset, self.target_path, exc,
+                "I/O error at global_disk_offset=%d on '%s': %s",
+                global_disk_offset, self.target_path, exc,
             )
             raise
 
